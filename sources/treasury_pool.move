@@ -89,7 +89,9 @@ module liquid_nation::treasury_pool {
     #[event]
     struct FeeDistributed has drop, store {
         token_name: String,
-        amount: u64,
+        treasury_fee_amount: u64,
+        protocol_fee_amount: u64,
+        protocol_recipient: address,
         timestamp: u64,
     }
 
@@ -331,20 +333,22 @@ module liquid_nation::treasury_pool {
         });
     }
 
-    /// Distribute fees to pool
-    public fun distribute_fees<CoinType>(fee_coins: Coin<CoinType>) acquires PoolState {
+    /// Distribute fees
+    public fun distribute_fees<CoinType>(treasury_fee_amount:u64, protocol_fee_amount: u64, protocol_recipient: address>) acquires PoolState {
         let pool = borrow_global_mut<PoolState<CoinType>>(@liquid_nation);
-        let fee_amount = coin::value(&fee_coins);
-        
-        coin::merge(&mut pool.asset_balance, fee_coins);
-        pool.fee_reserves = pool.fee_reserves + fee_amount;
+        let fee_coins = coin::extract(&mut pool.asset_balance, protocol_fee_amount);
+        coin::deposit(protocol_recipient, fee_coins);
+
+        pool.fee_reserves = pool.fee_reserves + treasury_fee_amount;
 
         let token_name = coin::name<CoinType>();
 
         // Emit event
         event::emit(FeeDistributed {
             token_name,
-            amount: fee_amount,
+            treasury_fee_amount,
+            protocol_fee_amount,
+            protocol_recipient,
             timestamp: timestamp::now_seconds(),
         });
     }
