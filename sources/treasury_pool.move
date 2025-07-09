@@ -124,7 +124,7 @@ module liquid_nation::treasury_pool {
             }
         }
     }
-    
+
 
     // ======================================================================================================================================================
     //                                                                   POOL MANAGEMENT
@@ -137,13 +137,15 @@ module liquid_nation::treasury_pool {
     ) acquires PoolRegistry {
         let admin_addr = signer::address_of(admin);
         let registry = borrow_global_mut<PoolRegistry>(@liquid_nation);
-        
-        assert!(registry.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
-        let type_info = type_info::type_of<CoinType>();
 
-        // Add token to registry
-        table::add(&mut registry.supported_tokens, type_info, true);
-        
+        assert!(registry.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
+        let type_info = type_info::type_of<CoinType>(); 
+        if (!table::contains(&registry.supported_tokens, type_info)) {
+            lp_token::initialize_lp_token<CoinType>();
+            // Add token to registry
+            table::add(&mut registry.supported_tokens, type_info, true);
+        };
+
         // Initialize pool state
         move_to(admin, PoolState<CoinType> {
             total_deposits: 0,
@@ -235,7 +237,8 @@ module liquid_nation::treasury_pool {
         );
 
         // Burn LP tokens
-        lp_token::burn_from<CoinType>(withdrawer_addr, lp_tokens_to_burn);
+        lp_token::burn_from<CoinType>(withdrawer, lp_tokens_to_burn);
+
 
         // Transfer coins to withdrawer
         let withdrawal_coins = coin::extract(&mut pool.asset_balance, withdrawal_amount);
@@ -345,20 +348,7 @@ module liquid_nation::treasury_pool {
             timestamp: timestamp::now_seconds(),
         });
     }
-
-    // public fun update_active_positions<CoinType>(amount: u64, is_add: bool) acquires PoolState {
-    //     let pool = borrow_global_mut<PoolState<CoinType>>(@liquid_nation);
-    //     if (is_add) {
-    //         pool.active_positions_value = pool.active_positions_value + amount;
-    //     } else {
-    //         pool.active_positions_value = if (pool.active_positions_value >= amount) {
-    //             pool.active_positions_value - amount
-    //         } else {
-    //             0
-    //         };
-    //     }
-    // }
-
+    
 
     // ======================================================================================================================================================
     //                                                              VIEW FUNCTIONS
