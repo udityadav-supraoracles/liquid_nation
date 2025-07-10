@@ -5,19 +5,19 @@ module liquid_nation::position_manager {
     use std::error;
     use std::timestamp;
     use aptos_std::table::{Self, Table};
+    use supra_framework::account::{Self, SignerCapability};
     use supra_framework::coin;
     use supra_framework::event;
-    use supra_framework::type_info;
     use liquid_nation::treasury_pool;
     use liquid_nation::fee_controller;
-    use liquid_nation::supra_oracle;
+    use supra_oracle::supra_oracle_storage;
 
 
     // ======================================================================================================================================================
     //                                                                          CONSTANTS
     // ======================================================================================================================================================
 
-
+    /// Maximum allowed leverage
     const MAX_LEVERAGE: u8 = 100;
     /// 500%
     const PROFIT_CAP: u64 = 500;
@@ -25,6 +25,8 @@ module liquid_nation::position_manager {
     const MIN_WAGER: u64 = 1_000_000;
     /// 100.00%
     const PERCENTAGE_PRECISION: u64 = 10000;
+    const U64_MAX: u64 = 18446744073709551615;
+
 
     // Error codes
     const E_NOT_AUTHORIZED: u64 = 1;
@@ -39,6 +41,7 @@ module liquid_nation::position_manager {
     const E_UNSUPPORTED_TOKEN: u64 = 10;
     const E_INVALID_ASSET: u64 = 11;
     const E_INSUFFICIENT_PAYOUT: u64 = 12;
+    const E_INVALID_AMOUNT: u64 = 13;
 
 
     // ======================================================================================================================================================
@@ -49,6 +52,7 @@ module liquid_nation::position_manager {
     struct Position has store, copy, drop {
         trader: address,
         asset: String,
+        pair_id: u32,
         amount_wagered: u64,
         leverage: u8,
         entry_price: u64,
@@ -68,6 +72,11 @@ module liquid_nation::position_manager {
         admin: address,
         paused: bool,
         automation_account: address,
+    }
+
+    /// Signer capability storage
+    struct ResourceAccountCapability has key {
+        signer_cap: SignerCapability,
     }
 
 
@@ -117,8 +126,16 @@ module liquid_nation::position_manager {
     /// Initializes the position manager
     fun init_module(admin: &signer) {
         let admin_addr = signer::address_of(admin);
-        
-        move_to(admin, PositionManager {
+
+        // Create resource account for position manager
+        let (resource_signer, signer_cap) = account::create_resource_account(admin, b"position_manager");
+
+        // Store the capability in the admin's account for future use
+        move_to(admin, ResourceAccountCapability {
+            signer_cap,
+        });
+
+        move_to(&resource_signer, PositionManager {
             positions: table::new(),
             user_positions: table::new(),
             position_counter: 0,
@@ -183,7 +200,7 @@ module liquid_nation::position_manager {
         };
 
         // Calculate leveraged PnL percentage
-        let max_safe_multiplier = u64::MAX / ((leverage as u64) * PERCENTAGE_PRECISION);
+        let max_safe_multiplier = U64_MAX / ((leverage as u64) * PERCENTAGE_PRECISION);
         assert!(price_change_abs <= max_safe_multiplier, error::invalid_argument(E_INVALID_WAGER));
 
         let leveraged_pnl_percentage = (price_change_abs * PERCENTAGE_PRECISION * (leverage as u64)) / entry_price;
@@ -245,9 +262,10 @@ module liquid_nation::position_manager {
         amount_wagered: u64,
         leverage: u8,
         is_long: bool,
+        pair_id: u32
     ) acquires PositionManager {
         let trader_addr = signer::address_of(trader);
-        let position_manager = borrow_global_mut<PositionManager>(@liquid_nation);
+        let position_manager = borrow_global_mut<PositionManager>(get_resource_account_address());
         
         assert!(!position_manager.paused, error::permission_denied(E_PAUSED));
         assert!(leverage >= 1 && leverage <= MAX_LEVERAGE, error::invalid_argument(E_INVALID_LEVERAGE));
@@ -272,11 +290,9 @@ module liquid_nation::position_manager {
             };
         };
 
-        let token_name = coin::name<CoinType>();
 
         // Get current price from oracle
-        let entry_price = supra_oracle::get_price(token_name);
-        let price_timestamp = supra_oracle::get_price_timestamp(token_name);
+        let (entry_price, _, price_timestamp, _) = supra_oracle_storage::get_price(pair_id);
         assert!(entry_price > 0 && timestamp::now_seconds() - price_timestamp <= 10, error::invalid_state(E_ORACLE_PRICE_STALE));
         let max_payout = amount_wagered + (amount_wagered * PROFIT_CAP / 100);
         
@@ -287,8 +303,9 @@ module liquid_nation::position_manager {
         );
 
         // Calculate liquidation and target prices
-        let liquidation_price = calculate_liquidation_price(entry_price, leverage, is_long);
-        let target_price = calculate_target_price(entry_price, leverage, is_long);
+        let entry_price_u64 = (entry_price as u64);
+        let liquidation_price = calculate_liquidation_price(entry_price_u64, leverage, is_long);
+        let target_price = calculate_target_price(entry_price_u64, leverage, is_long);
 
         // Transfer asset to treasury
         let coins = coin::withdraw<CoinType>(trader, amount_wagered);
@@ -298,12 +315,15 @@ module liquid_nation::position_manager {
         let position_id = position_manager.position_counter;
         position_manager.position_counter = position_id + 1;
 
+        let token_name = coin::name<CoinType>();
+
         let position = Position {
             trader: trader_addr,
             asset: token_name,
+            pair_id,
             amount_wagered,
             leverage,
-            entry_price,
+            entry_price: entry_price_u64,
             liquidation_price,
             target_price,
             timestamp_opened: timestamp::now_seconds(),
@@ -329,7 +349,7 @@ module liquid_nation::position_manager {
             asset: token_name,
             amount_wagered,
             leverage,
-            entry_price,
+            entry_price: entry_price_u64,
             is_long,
             timestamp: timestamp::now_seconds(),
             liquidation_price,
@@ -343,7 +363,7 @@ module liquid_nation::position_manager {
         position_id: u64,
     ) acquires PositionManager {
         let trader_addr = signer::address_of(trader);
-        let position_manager = borrow_global_mut<PositionManager>(@liquid_nation);
+        let position_manager = borrow_global_mut<PositionManager>(get_resource_account_address());
         
         assert!(table::contains(&position_manager.positions, position_id), error::not_found(E_POSITION_NOT_FOUND));
         
@@ -357,16 +377,15 @@ module liquid_nation::position_manager {
         );
 
         // Get current price
-        let current_price = supra_oracle::get_price(position.asset);
-        let price_timestamp = supra_oracle::get_price_timestamp(position.asset);
+        let (current_price, _, price_timestamp, _) = supra_oracle_storage::get_price(position.pair_id);
         assert!(current_price > 0 && timestamp::now_seconds() - price_timestamp <= 10, error::invalid_state(E_ORACLE_PRICE_STALE));
-        
+        let current_price_u64 = (current_price as u64);
         // Calculate payout
         let (_, payout_amount, pnl_percentage) = calculate_payout(
             position.amount_wagered,
             position.leverage,
             position.entry_price,
-            current_price,
+            current_price_u64,
             position.is_long
         );
 
@@ -382,7 +401,7 @@ module liquid_nation::position_manager {
 
         // Update position
         position.is_closed = true;
-        position.exit_price = current_price;
+        position.exit_price = current_price_u64;
         position.payout_amount = net_payout;
 
         // Handle payout
@@ -401,7 +420,7 @@ module liquid_nation::position_manager {
         event::emit(PositionClosed {
             position_id,
             trader: trader_addr,
-            exit_price: current_price,
+            exit_price: current_price_u64,
             payout_amount: net_payout,
             pnl_percentage,
             timestamp: timestamp::now_seconds(),
@@ -415,7 +434,7 @@ module liquid_nation::position_manager {
     ) acquires PositionManager {
         let automation_addr = signer::address_of(_automation);
 
-        let position_manager = borrow_global_mut<PositionManager>(@liquid_nation);
+        let position_manager = borrow_global_mut<PositionManager>(get_resource_account_address());
         assert!(automation_addr == position_manager.automation_account, error::permission_denied(E_NOT_AUTHORIZED));
         assert!(table::contains(&position_manager.positions, position_id), error::not_found(E_POSITION_NOT_FOUND));
         
@@ -427,27 +446,27 @@ module liquid_nation::position_manager {
             error::invalid_argument(E_INVALID_ASSET)
         );
 
-        let current_price = supra_oracle::get_price(position.asset);
-        let price_timestamp = supra_oracle::get_price_timestamp(position.asset);
+        let (current_price, _, price_timestamp, _) = supra_oracle_storage::get_price(position.pair_id);
         assert!(current_price > 0 && timestamp::now_seconds() - price_timestamp <= 10, error::invalid_state(E_ORACLE_PRICE_STALE));
+        let current_price_u64 = (current_price as u64);
         
         // Check if position should be liquidated or hit profit cap
-        let should_liquidate = check_liquidation(position, current_price);
-        let hit_profit_cap = check_profit_cap(position, current_price);
+        let should_liquidate = check_liquidation(position, current_price_u64);
+        let hit_profit_cap = check_profit_cap(position, current_price_u64);
         
         assert!(should_liquidate || hit_profit_cap, error::invalid_state(E_NOT_AUTHORIZED));
 
         if (should_liquidate) {
             // Liquidation - trader gets nothing
             position.is_closed = true;
-            position.exit_price = current_price;
+            position.exit_price = current_price_u64;
             position.payout_amount = 0;
             treasury_pool::record_loss<CoinType>(position.amount_wagered);
 
             event::emit(PositionLiquidated {
                 position_id,
                 trader: position.trader,
-                liquidation_price: current_price,
+                liquidation_price: current_price_u64,
                 timestamp: timestamp::now_seconds(),
             });
         } else {
@@ -460,7 +479,7 @@ module liquid_nation::position_manager {
             let net_payout = max_payout - fee_amount;
 
             position.is_closed = true;
-            position.exit_price = current_price;
+            position.exit_price = current_price_u64;
             position.payout_amount = net_payout;
 
             // Handle payout
@@ -476,7 +495,7 @@ module liquid_nation::position_manager {
             event::emit(PositionClosed {
                 position_id,
                 trader: position.trader,
-                exit_price: current_price,
+                exit_price: current_price_u64,
                 payout_amount: net_payout,
                 pnl_percentage: PROFIT_CAP,
                 timestamp: timestamp::now_seconds(),
@@ -492,14 +511,14 @@ module liquid_nation::position_manager {
 
     #[view]
     public fun get_position(position_id: u64): Position acquires PositionManager {
-        let position_manager = borrow_global<PositionManager>(@liquid_nation);
+        let position_manager = borrow_global<PositionManager>(get_resource_account_address());
         assert!(table::contains(&position_manager.positions, position_id), error::not_found(E_POSITION_NOT_FOUND));
         *table::borrow(&position_manager.positions, position_id)
     }
 
     #[view]
     public fun get_user_positions(user: address): vector<u64> acquires PositionManager {
-        let position_manager = borrow_global<PositionManager>(@liquid_nation);
+        let position_manager = borrow_global<PositionManager>(get_resource_account_address());
         if (table::contains(&position_manager.user_positions, user)) {
             *table::borrow(&position_manager.user_positions, user)
         } else {
@@ -509,25 +528,30 @@ module liquid_nation::position_manager {
 
     #[view]
     public fun calculate_current_pnl(position_id: u64): (u8, u64, u64) acquires PositionManager {
-        let position_manager = borrow_global<PositionManager>(@liquid_nation);
+        let position_manager = borrow_global<PositionManager>(get_resource_account_address());
         let position = table::borrow(&position_manager.positions, position_id);
         
         if (position.is_closed) {
             return (0, position.payout_amount, 0)
         };
 
-        let current_price = supra_oracle::get_price(position.asset);
-        let price_timestamp = supra_oracle::get_price_timestamp(position.asset);
+        let (current_price, _, price_timestamp, _) = supra_oracle_storage::get_price(position.pair_id);
         assert!(current_price > 0 && timestamp::now_seconds() - price_timestamp <= 10, error::invalid_state(E_ORACLE_PRICE_STALE));
+        let current_price_u64 = (current_price as u64);
         calculate_payout(
             position.amount_wagered,
             position.leverage,
             position.entry_price,
-            current_price,
+            current_price_u64,
             position.is_long
         )
     }
 
+    #[view]
+    /// Returns the resource account address
+    fun get_resource_account_address(): address {
+        account::create_resource_address(&@liquid_nation, b"lp_tokens")
+    }
 
     // ======================================================================================================================================================
     //                                                              ADMIN FUNCTIONS
@@ -537,7 +561,7 @@ module liquid_nation::position_manager {
     /// Pauses the open_position
     public entry fun pause(admin: &signer) acquires PositionManager {
         let admin_addr = signer::address_of(admin);
-        let position_manager = borrow_global_mut<PositionManager>(@liquid_nation);
+        let position_manager = borrow_global_mut<PositionManager>(get_resource_account_address());
         assert!(position_manager.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
         position_manager.paused = true;
     }
@@ -545,7 +569,7 @@ module liquid_nation::position_manager {
     /// Unpauses the open_position
     public entry fun unpause(admin: &signer) acquires PositionManager {
         let admin_addr = signer::address_of(admin);
-        let position_manager = borrow_global_mut<PositionManager>(@liquid_nation);
+        let position_manager = borrow_global_mut<PositionManager>(get_resource_account_address());
         assert!(position_manager.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
         position_manager.paused = false;
     }
@@ -553,7 +577,7 @@ module liquid_nation::position_manager {
     /// Sets the automation account
     public entry fun set_automation_account(admin: &signer, new_automation_account: address) acquires PositionManager {
         let admin_addr = signer::address_of(admin);
-        let position_manager = borrow_global_mut<PositionManager>(@liquid_nation);
+        let position_manager = borrow_global_mut<PositionManager>(get_resource_account_address());
         assert!(position_manager.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
         position_manager.automation_account = new_automation_account;
     }

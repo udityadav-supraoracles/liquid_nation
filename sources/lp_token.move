@@ -3,10 +3,11 @@ module liquid_nation::lp_token {
 
     use std::error;
     use std::signer;
+    use std::option;
     use std::string::{Self, String};
     use std::table::{Self, Table};
     use supra_framework::account::{Self, SignerCapability};
-    use supra_framework::coin::{Self, Coin, BurnCapability, FreezeCapability, MintCapability};
+    use supra_framework::coin::{Self, BurnCapability, FreezeCapability, MintCapability};
     use supra_framework::type_info::{Self, TypeInfo};
 
 
@@ -103,10 +104,10 @@ module liquid_nation::lp_token {
         let coin_decimals = coin::decimals<CoinType>();
 
         // Create LP token name and symbol
-        let mut lp_name = string::utf8(b"LP-");
+        let lp_name = string::utf8(b"LP-");
         string::append(&mut lp_name, coin_name);
 
-        let mut lp_symbol = string::utf8(b"lp");
+        let lp_symbol = string::utf8(b"lp");
         string::append(&mut lp_symbol, coin_symbol);
 
         // Initialize the LP token capabilities using resource account
@@ -137,7 +138,7 @@ module liquid_nation::lp_token {
         let resource_addr = get_resource_account_address();
         let caps = borrow_global<LPTokenCapabilities<CoinType>>(resource_addr);
         let coins = coin::mint(amount, &caps.mint_cap);
-        coin::force_deposit(recipient, coins);
+        coin::deposit(recipient, coins);
     }
 
     /// Burn LP tokens from a user (called by treasury pool)
@@ -158,7 +159,7 @@ module liquid_nation::lp_token {
         amount: u64,
     ) {
         let coins = coin::withdraw<LPToken<CoinType>>(from, amount);
-        coin::force_deposit(to, coins);
+        coin::deposit(to, coins);
     }
 
 
@@ -219,7 +220,9 @@ module liquid_nation::lp_token {
     #[view]
     /// Get total supply of LP tokens
     public fun total_supply<CoinType>(): u128 {
-        coin::supply<LPToken<CoinType>>()
+        // Remove option::some() wrapper
+        let supply_opt = coin::supply<LPToken<CoinType>>();
+        option::extract(&mut supply_opt)
     }
 
     #[view]
@@ -230,7 +233,7 @@ module liquid_nation::lp_token {
 
     #[view]
     /// Returns the resource account address
-    fun get_resource_account_address(): address acquires LPTokenRegistry {
+    fun get_resource_account_address(): address {
         account::create_resource_address(&@liquid_nation, b"lp_tokens")
     }
 }
