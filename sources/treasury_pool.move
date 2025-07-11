@@ -1,12 +1,17 @@
 module liquid_nation::treasury_pool {
+    friend liquid_nation::position_manager;
+
     use std::signer;
     use std::error;
     use std::string::String;
+    use aptos_std::table::{Self, Table};
+    use aptos_std::math64;
+    use supra_framework::account::{Self, SignerCapability};
     use supra_framework::coin::{Self, Coin};
     use supra_framework::event;
     use supra_framework::timestamp;
     use supra_framework::type_info::{Self, TypeInfo};
-    use aptos_std::table::{Self, Table};
+    use supra_oracle::supra_oracle_storage;
     use liquid_nation::lp_token;
 
 
@@ -15,10 +20,13 @@ module liquid_nation::treasury_pool {
     // ======================================================================================================================================================
 
 
-    /// 1M precision for calculations
-    const PRECISION: u64 = 1000000;
-    /// 1 USD minimum deposit
-    const MIN_DEPOSIT: u64 = 1000000;
+    /// Minimum deposit set to 1 USD
+    const MIN_AMOUNT: u64 = 10^18;
+    /// Basis points for precision (10000 = 100%)
+    const BASIS_POINTS: u64 = 10000;
+    /// Minimum basis points for operational buffer (500 = 5%)
+    const OPERATIONAL_BUFFER_BP: u64 = 500;
+
 
     /// Error codes
     const E_NOT_AUTHORIZED: u64 = 1;
@@ -27,6 +35,7 @@ module liquid_nation::treasury_pool {
     const E_POOL_NOT_INITIALIZED: u64 = 4;
     const E_INSUFFICIENT_LIQUIDITY: u64 = 5;
     const E_POOL_PAUSED: u64 = 6;
+    const E_ORACLE_PRICE_STALE: u64 = 7;
 
 
     // ======================================================================================================================================================
@@ -51,6 +60,11 @@ module liquid_nation::treasury_pool {
     struct PoolRegistry has key {
         supported_tokens: Table<TypeInfo, bool>,
         admin: address,
+    }
+
+    /// Signer capability storage
+    struct ResourceAccountCapability has key {
+        signer_cap: SignerCapability,
     }
 
 
@@ -89,7 +103,10 @@ module liquid_nation::treasury_pool {
     #[event]
     struct FeeDistributed has drop, store {
         token_name: String,
-        amount: u64,
+        total_fee_amount: u64,
+        treasury_fee_amount: u64,
+        protocol_fee_amount: u64,
+        protocol_recipient: address,
         timestamp: u64,
     }
 
@@ -99,11 +116,20 @@ module liquid_nation::treasury_pool {
     // ======================================================================================================================================================
 
 
-    /// Initialize pool registry
+    /// Initialize the pool registry
     fun init_module(admin: &signer) {
         let admin_addr = signer::address_of(admin);
-        
-        move_to(admin, PoolRegistry {
+
+        // Create resource account for treasury pool
+        let (resource_signer, signer_cap) = account::create_resource_account(admin, b"treasury_pool");
+
+        // Store the capability in the admin's account for future use
+        move_to(admin, ResourceAccountCapability {
+            signer_cap,
+        });
+
+        // Move pool registry to the resource account
+        move_to(&resource_signer, PoolRegistry {
             supported_tokens: table::new(),
             admin: admin_addr,
         });
@@ -125,51 +151,49 @@ module liquid_nation::treasury_pool {
         }
     }
 
+    /// Calculates USD value of token amount using oracle price (returns value with 18 decimals)
+    public(friend) fun calculate_usd_value(
+        token_amount: u64,
+        token_decimals: u8,
+        oracle_price: u128,
+        oracle_price_decimals: u16
+    ): u64 {
+        let price_u64 = (oracle_price as u64);
+        
+        // Calculate USD value with 18 decimal precision
+        let token_decimal_factor = math64::pow(10, (token_decimals as u64));
+        let price_decimal_factor = math64::pow(10, (oracle_price_decimals as u64));
+        
+        (token_amount * price_u64 * MIN_AMOUNT) / (token_decimal_factor * price_decimal_factor)
+    }
+
+    fun ensure_pool_initialized<CoinType>() {
+        let resource_addr = get_resource_account_address();
+        assert!(exists<PoolState<CoinType>>(resource_addr), error::invalid_state(E_POOL_NOT_INITIALIZED));
+    }
+
 
     // ======================================================================================================================================================
     //                                                                   POOL MANAGEMENT
     // ======================================================================================================================================================
 
 
-    /// Initialize pool for a specific token
-    public entry fun initialize_pool<CoinType>(
-        admin: &signer
-    ) acquires PoolRegistry {
-        let admin_addr = signer::address_of(admin);
-        let registry = borrow_global_mut<PoolRegistry>(@liquid_nation);
-
-        assert!(registry.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
-        let type_info = type_info::type_of<CoinType>(); 
-        if (!table::contains(&registry.supported_tokens, type_info)) {
-            lp_token::initialize_lp_token<CoinType>();
-            // Add token to registry
-            table::add(&mut registry.supported_tokens, type_info, true);
-        };
-
-        // Initialize pool state
-        move_to(admin, PoolState<CoinType> {
-            total_deposits: 0,
-            total_lp_tokens: 0,
-            active_positions_value: 0,
-            cumulative_pnl: 0,
-            pnl_is_positive: true,
-            fee_reserves: 0,
-            asset_balance: coin::zero<CoinType>(),
-            admin: admin_addr,
-            paused: false,
-        });
-    }
-
     /// Deposit liquidity to pool
     public entry fun deposit<CoinType>(
         depositor: &signer,
         amount: u64,
+        pair_id: u32
     ) acquires PoolState {
-        let depositor_addr = signer::address_of(depositor);
-        let pool = borrow_global_mut<PoolState<CoinType>>(@liquid_nation);
-        
+        ensure_pool_initialized<CoinType>();
+        let pool = borrow_global_mut<PoolState<CoinType>>(get_resource_account_address());
         assert!(!pool.paused, error::permission_denied(E_POOL_PAUSED));
-        assert!(amount >= MIN_DEPOSIT, error::invalid_argument(E_INVALID_AMOUNT));
+        
+        let depositor_addr = signer::address_of(depositor);
+
+        let (price, price_decimals, price_timestamp, _) = supra_oracle_storage::get_price(pair_id);
+        assert!(price > 0 && timestamp::now_seconds() - price_timestamp <= 10, error::invalid_state(E_ORACLE_PRICE_STALE));
+        let usd_value = calculate_usd_value(amount, coin::decimals<CoinType>(), (price as u128), price_decimals);
+        assert!(usd_value >= MIN_AMOUNT, error::invalid_argument(E_INVALID_AMOUNT));
 
         // Calculate LP tokens to mint
         let lp_tokens_to_mint = if (pool.total_lp_tokens == 0) {
@@ -211,8 +235,9 @@ module liquid_nation::treasury_pool {
         withdrawer: &signer,
         lp_tokens_to_burn: u64
     ) acquires PoolState {
+        ensure_pool_initialized<CoinType>();
         let withdrawer_addr = signer::address_of(withdrawer);
-        let pool = borrow_global_mut<PoolState<CoinType>>(@liquid_nation);
+        let pool = borrow_global_mut<PoolState<CoinType>>(get_resource_account_address());
         
         assert!(!pool.paused, error::permission_denied(E_POOL_PAUSED));
         assert!(lp_tokens_to_burn > 0, error::invalid_argument(E_INVALID_AMOUNT));
@@ -263,8 +288,10 @@ module liquid_nation::treasury_pool {
     }
 
     /// Deposit asset from trading positions
-    public fun deposit_asset<CoinType>(coins: Coin<CoinType>) acquires PoolState {
-        let pool = borrow_global_mut<PoolState<CoinType>>(@liquid_nation);
+    public(friend) fun deposit_asset<CoinType>(coins: Coin<CoinType>) acquires PoolState {
+        ensure_pool_initialized<CoinType>();
+        
+        let pool = borrow_global_mut<PoolState<CoinType>>(get_resource_account_address());
         let amount = coin::value(&coins);
         
         coin::merge(&mut pool.asset_balance, coins);
@@ -272,8 +299,9 @@ module liquid_nation::treasury_pool {
     }
 
     /// Withdraw payout for winning positions
-    public fun withdraw_payout<CoinType>(payout_amount: u64, wagered_amount: u64): Coin<CoinType> acquires PoolState {
-        let pool = borrow_global_mut<PoolState<CoinType>>(@liquid_nation);
+    public(friend) fun withdraw_payout<CoinType>(payout_amount: u64, wagered_amount: u64): Coin<CoinType> acquires PoolState {
+        ensure_pool_initialized<CoinType>();
+        let pool = borrow_global_mut<PoolState<CoinType>>(get_resource_account_address());
         
         assert!(
             coin::value(&pool.asset_balance) >= payout_amount,
@@ -303,8 +331,9 @@ module liquid_nation::treasury_pool {
     }
 
     /// Record loss from liquidated position (pool gains money)
-    public fun record_loss<CoinType>(amount: u64) acquires PoolState {
-        let pool = borrow_global_mut<PoolState<CoinType>>(@liquid_nation);
+    public(friend) fun record_loss<CoinType>(amount: u64) acquires PoolState {
+        ensure_pool_initialized<CoinType>();
+        let pool = borrow_global_mut<PoolState<CoinType>>(get_resource_account_address());
         
         // Update PnL (pool gains money when traders lose)
         if (!pool.pnl_is_positive) {
@@ -331,20 +360,22 @@ module liquid_nation::treasury_pool {
         });
     }
 
-    /// Distribute fees to pool
-    public fun distribute_fees<CoinType>(fee_coins: Coin<CoinType>) acquires PoolState {
-        let pool = borrow_global_mut<PoolState<CoinType>>(@liquid_nation);
-        let fee_amount = coin::value(&fee_coins);
-        
-        coin::merge(&mut pool.asset_balance, fee_coins);
-        pool.fee_reserves = pool.fee_reserves + fee_amount;
+    /// Distribute fees
+    public fun distribute_fees<CoinType>(total_fee_amount: u64, treasury_fee_amount:u64, protocol_fee_amount: u64, protocol_recipient: address) acquires PoolState {
+        ensure_pool_initialized<CoinType>();
+        let pool = borrow_global_mut<PoolState<CoinType>>(get_resource_account_address());
+        let fee_coins = coin::extract(&mut pool.asset_balance, protocol_fee_amount);
+        coin::deposit(protocol_recipient, fee_coins);
 
-        let token_name = coin::name<CoinType>();
+        pool.fee_reserves = pool.fee_reserves + treasury_fee_amount;
 
         // Emit event
         event::emit(FeeDistributed {
-            token_name,
-            amount: fee_amount,
+            token_name: coin::name<CoinType>(),
+            total_fee_amount,
+            treasury_fee_amount,
+            protocol_fee_amount,
+            protocol_recipient,
             timestamp: timestamp::now_seconds(),
         });
     }
@@ -356,7 +387,7 @@ module liquid_nation::treasury_pool {
 
     #[view]
     public fun get_pool_info<CoinType>(): (u64, u64, u64, u64, bool) acquires PoolState {
-        let pool = borrow_global<PoolState<CoinType>>(@liquid_nation);
+        let pool = borrow_global<PoolState<CoinType>>(get_resource_account_address());
         (
             pool.total_deposits,
             pool.total_lp_tokens,
@@ -368,13 +399,13 @@ module liquid_nation::treasury_pool {
 
     #[view]
     public fun get_pool_value<CoinType>(): u64 acquires PoolState {
-        let pool = borrow_global<PoolState<CoinType>>(@liquid_nation);
+        let pool = borrow_global<PoolState<CoinType>>(get_resource_account_address());
         calculate_pool_value(pool)
     }
 
     #[view]
     public fun calculate_lp_token_value<CoinType>(lp_tokens: u64): u64 acquires PoolState {
-        let pool = borrow_global<PoolState<CoinType>>(@liquid_nation);
+        let pool = borrow_global<PoolState<CoinType>>(get_resource_account_address());
         if (pool.total_lp_tokens == 0) {
             0
         } else {
@@ -385,7 +416,7 @@ module liquid_nation::treasury_pool {
 
     #[view]
     public fun is_token_supported<CoinType>(): bool acquires PoolRegistry {
-        let registry = borrow_global<PoolRegistry>(@liquid_nation);
+        let registry = borrow_global<PoolRegistry>(get_resource_account_address());
         let type_info = type_info::type_of<CoinType>();
         table::contains(&registry.supported_tokens, type_info)
     }
@@ -393,11 +424,11 @@ module liquid_nation::treasury_pool {
     #[view]
     /// Checks if pool can cover maximum payout
     public fun can_cover_payout<CoinType>(max_payout: u64): bool acquires PoolState {
-        let pool = borrow_global<PoolState<CoinType>>(@liquid_nation);
+        let pool = borrow_global<PoolState<CoinType>>(get_resource_account_address());
         let available_balance = coin::value(&pool.asset_balance);
         
         // Reserve some liquidity for withdrawals
-        let reserved_amount = available_balance / 20; // 5% operational buffer
+        let reserved_amount = (available_balance * OPERATIONAL_BUFFER_BP) / BASIS_POINTS;
         let available_for_payouts = if (available_balance > reserved_amount) {
             available_balance - reserved_amount
         } else {
@@ -405,6 +436,12 @@ module liquid_nation::treasury_pool {
         };
         
         max_payout <= available_for_payouts
+    }
+
+    #[view]
+    /// Returns the resource account address
+    fun get_resource_account_address(): address {
+        account::create_resource_address(&@liquid_nation, b"treasury_pool")
     }
 
 
@@ -416,7 +453,7 @@ module liquid_nation::treasury_pool {
     /// Pauses the deposit and withdraw
     public entry fun pause_pool<CoinType>(admin: &signer) acquires PoolState {
         let admin_addr = signer::address_of(admin);
-        let pool = borrow_global_mut<PoolState<CoinType>>(@liquid_nation);
+        let pool = borrow_global_mut<PoolState<CoinType>>(get_resource_account_address());
         assert!(pool.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
         pool.paused = true;
     }
@@ -424,21 +461,51 @@ module liquid_nation::treasury_pool {
     /// Unpauses the deposit and withdraw
     public entry fun unpause_pool<CoinType>(admin: &signer) acquires PoolState {
         let admin_addr = signer::address_of(admin);
-        let pool = borrow_global_mut<PoolState<CoinType>>(@liquid_nation);
+        let pool = borrow_global_mut<PoolState<CoinType>>(get_resource_account_address());
         assert!(pool.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
         pool.paused = false;
     }
 
-    /// Add a token
+    /// Add a token and initialize its pool
     public entry fun add_supported_token<CoinType>(
         admin: &signer,
-    ) acquires PoolRegistry {
+    ) acquires PoolRegistry, ResourceAccountCapability {
         let admin_addr = signer::address_of(admin);
-        let registry = borrow_global_mut<PoolRegistry>(@liquid_nation);
-        let type = type_info::type_of<CoinType>();
-        
+        let resource_addr = get_resource_account_address();
+
+        // Early exit if pool already exists
+        if (exists<PoolState<CoinType>>(resource_addr)) return;
+
+        let registry = borrow_global_mut<PoolRegistry>(resource_addr);
         assert!(registry.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
-        table::add(&mut registry.supported_tokens, type, true);
+
+        let type_info = type_info::type_of<CoinType>();
+
+        // Add to registry (idempotent)
+        if (!table::contains(&registry.supported_tokens, type_info)) {
+            table::add(&mut registry.supported_tokens, type_info, true);
+        };
+
+        // Try to initialize LP token (might already exist)
+        // Note: This might abort if LP token already exists - consider making it idempotent
+        lp_token::initialize_lp_token<CoinType>();
+
+        // Initialize pool state
+        let resource_signer = account::create_signer_with_capability(
+            &borrow_global<ResourceAccountCapability>(admin_addr).signer_cap
+        );
+
+        move_to(&resource_signer, PoolState<CoinType> {
+            total_deposits: 0,
+            total_lp_tokens: 0,
+            active_positions_value: 0,
+            cumulative_pnl: 0,
+            pnl_is_positive: true,
+            fee_reserves: 0,
+            asset_balance: coin::zero<CoinType>(),
+            admin: admin_addr,
+            paused: false,
+        });
     }
 
     /// Remove a token
@@ -446,7 +513,7 @@ module liquid_nation::treasury_pool {
         admin: &signer,
     ) acquires PoolRegistry {
         let admin_addr = signer::address_of(admin);
-        let registry = borrow_global_mut<PoolRegistry>(@liquid_nation);
+        let registry = borrow_global_mut<PoolRegistry>(get_resource_account_address());
         let type = type_info::type_of<CoinType>();
         
         assert!(registry.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
@@ -459,7 +526,7 @@ module liquid_nation::treasury_pool {
         amount: u64,
     ) acquires PoolState {
         let admin_addr = signer::address_of(admin);
-        let pool = borrow_global_mut<PoolState<CoinType>>(@liquid_nation);
+        let pool = borrow_global_mut<PoolState<CoinType>>(get_resource_account_address());
         
         assert!(pool.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
         assert!(pool.paused, error::permission_denied(E_NOT_AUTHORIZED));
