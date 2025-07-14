@@ -95,8 +95,8 @@ module liquid_nation::fee_controller {
         // Create resource account for treasury pool
         let (resource_signer, signer_cap) = account::create_resource_account(admin, b"fee_controller");
 
-        // Store the capability in the admin's account for future use
-        move_to(admin, ResourceAccountCapability {
+        // Move the capability to the resource account
+        move_to(&resource_signer, ResourceAccountCapability {
             signer_cap,
         });
         
@@ -251,26 +251,16 @@ module liquid_nation::fee_controller {
 
     #[view]
     /// Get fee configuration
-    public fun get_fee_info(): (u64, u64, u64, address) acquires FeeConfig {
+    public fun get_fee_info(): (u64, u64, u64, address, address, bool) acquires FeeConfig {
         let config = borrow_global<FeeConfig>(get_resource_account_address());
         (
             config.fee_rate,
             config.treasury_share,
             config.protocol_share,
-            config.protocol_recipient
+            config.protocol_recipient,
+            config.admin,
+            config.paused
         )
-    }
-
-    #[view]
-    public fun is_fee_distribution_paused(): bool acquires FeeConfig {
-        let config = borrow_global<FeeConfig>(get_resource_account_address());
-        config.paused
-    }
-
-    #[view]
-    public fun get_admin(): address acquires FeeConfig {
-        let config = borrow_global<FeeConfig>(get_resource_account_address());
-        config.admin
     }
 
     #[view]
@@ -282,12 +272,6 @@ module liquid_nation::fee_controller {
             stats.protocol_fees_distributed,
             stats.last_update
         )
-    }
-
-    #[view]
-    public fun get_current_fee_rate(): u64 acquires FeeConfig {
-        let config = borrow_global<FeeConfig>(get_resource_account_address());
-        config.fee_rate
     }
 
     #[view]

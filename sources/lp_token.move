@@ -20,7 +20,8 @@ module liquid_nation::lp_token {
     const E_NOT_AUTHORIZED: u64 = 1;
     const E_INSUFFICIENT_BALANCE: u64 = 2;
     const E_TOKEN_NOT_INITIALIZED: u64 = 3;
-    const E_TOKEN_ALREADY_INITIALIZED: u64 = 5;
+    const E_TOKEN_ALREADY_INITIALIZED: u64 = 4;
+    const E_INVALID_ADDRESS: u64 = 5;
 
 
     // ======================================================================================================================================================
@@ -196,6 +197,19 @@ module liquid_nation::lp_token {
         coin::unfreeze_coin_store(account, &caps.freeze_cap);
     }
 
+    public entry fun transfer_admin(
+        admin: &signer,
+        new_admin: address,
+    ) acquires LPTokenRegistry {
+        let admin_addr = signer::address_of(admin);
+        let registry = borrow_global_mut<LPTokenRegistry>(get_resource_account_address());
+        
+        assert!(registry.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
+        assert!(new_admin != @0x0, error::invalid_argument(E_INVALID_ADDRESS));
+
+        registry.admin = new_admin;
+    }
+
     
     // ======================================================================================================================================================
     //                                                              VIEW FUNCTIONS
@@ -220,7 +234,6 @@ module liquid_nation::lp_token {
     #[view]
     /// Get total supply of LP tokens
     public fun total_supply<CoinType>(): u128 {
-        // Remove option::some() wrapper
         let supply_opt = coin::supply<LPToken<CoinType>>();
         option::extract(&mut supply_opt)
     }

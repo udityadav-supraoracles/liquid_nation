@@ -36,6 +36,7 @@ module liquid_nation::treasury_pool {
     const E_INSUFFICIENT_LIQUIDITY: u64 = 5;
     const E_POOL_PAUSED: u64 = 6;
     const E_ORACLE_PRICE_STALE: u64 = 7;
+    const E_INVALID_ADDRESS: u64 = 8;
 
 
     // ======================================================================================================================================================
@@ -52,7 +53,6 @@ module liquid_nation::treasury_pool {
         pnl_is_positive: bool,
         fee_reserves: u64,
         asset_balance: Coin<CoinType>,
-        admin: address,
         paused: bool,
     }
 
@@ -123,8 +123,8 @@ module liquid_nation::treasury_pool {
         // Create resource account for treasury pool
         let (resource_signer, signer_cap) = account::create_resource_account(admin, b"treasury_pool");
 
-        // Store the capability in the admin's account for future use
-        move_to(admin, ResourceAccountCapability {
+        // Move the capability to the resource account
+        move_to(&resource_signer, ResourceAccountCapability {
             signer_cap,
         });
 
@@ -261,26 +261,22 @@ module liquid_nation::treasury_pool {
             error::resource_exhausted(E_INSUFFICIENT_BALANCE)
         );
 
+        // Update pool state
+        assert!(pool.total_deposits >= withdrawal_amount, error::invalid_state(E_INSUFFICIENT_BALANCE));
+        pool.total_deposits = pool.total_deposits - withdrawal_amount;
+        pool.total_lp_tokens = pool.total_lp_tokens - lp_tokens_to_burn;
+
         // Burn LP tokens
         lp_token::burn_from<CoinType>(withdrawer, lp_tokens_to_burn);
-
 
         // Transfer coins to withdrawer
         let withdrawal_coins = coin::extract(&mut pool.asset_balance, withdrawal_amount);
         coin::deposit(withdrawer_addr, withdrawal_coins);
 
-        // Update pool state
-        assert!(pool.total_deposits >= withdrawal_amount, error::invalid_state(E_INSUFFICIENT_BALANCE));
-
-        pool.total_deposits = pool.total_deposits - withdrawal_amount;
-        pool.total_lp_tokens = pool.total_lp_tokens - lp_tokens_to_burn;
-
-        let token_name = coin::name<CoinType>();
-
         // Emit event
         event::emit(PoolWithdrawal {
             withdrawer: withdrawer_addr,
-            token_name,
+            token_name: coin::name<CoinType>(),
             amount: withdrawal_amount,
             lp_tokens_burned: lp_tokens_to_burn,
             timestamp: timestamp::now_seconds(),
@@ -451,18 +447,20 @@ module liquid_nation::treasury_pool {
 
 
     /// Pauses the deposit and withdraw
-    public entry fun pause_pool<CoinType>(admin: &signer) acquires PoolState {
+    public entry fun pause_pool<CoinType>(admin: &signer) acquires PoolState, PoolRegistry {
         let admin_addr = signer::address_of(admin);
+        let registry = borrow_global_mut<PoolRegistry>(get_resource_account_address());
         let pool = borrow_global_mut<PoolState<CoinType>>(get_resource_account_address());
-        assert!(pool.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
+        assert!(registry.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
         pool.paused = true;
     }
 
     /// Unpauses the deposit and withdraw
-    public entry fun unpause_pool<CoinType>(admin: &signer) acquires PoolState {
+    public entry fun unpause_pool<CoinType>(admin: &signer) acquires PoolState, PoolRegistry {
         let admin_addr = signer::address_of(admin);
+        let registry = borrow_global_mut<PoolRegistry>(get_resource_account_address());
         let pool = borrow_global_mut<PoolState<CoinType>>(get_resource_account_address());
-        assert!(pool.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
+        assert!(registry.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
         pool.paused = false;
     }
 
@@ -487,12 +485,12 @@ module liquid_nation::treasury_pool {
         };
 
         // Try to initialize LP token (might already exist)
-        // Note: This might abort if LP token already exists - consider making it idempotent
+        // Note: This might abort if LP token already exists
         lp_token::initialize_lp_token<CoinType>();
 
         // Initialize pool state
         let resource_signer = account::create_signer_with_capability(
-            &borrow_global<ResourceAccountCapability>(admin_addr).signer_cap
+            &borrow_global<ResourceAccountCapability>(resource_addr).signer_cap
         );
 
         move_to(&resource_signer, PoolState<CoinType> {
@@ -503,7 +501,6 @@ module liquid_nation::treasury_pool {
             pnl_is_positive: true,
             fee_reserves: 0,
             asset_balance: coin::zero<CoinType>(),
-            admin: admin_addr,
             paused: false,
         });
     }
@@ -524,11 +521,12 @@ module liquid_nation::treasury_pool {
     public entry fun emergency_withdraw<CoinType>(
         admin: &signer,
         amount: u64,
-    ) acquires PoolState {
+    ) acquires PoolState, PoolRegistry {
         let admin_addr = signer::address_of(admin);
+        let registry = borrow_global_mut<PoolRegistry>(get_resource_account_address());
         let pool = borrow_global_mut<PoolState<CoinType>>(get_resource_account_address());
         
-        assert!(pool.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
+        assert!(registry.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
         assert!(pool.paused, error::permission_denied(E_NOT_AUTHORIZED));
         
         assert!(
@@ -538,5 +536,18 @@ module liquid_nation::treasury_pool {
         
         let emergency_coins = coin::extract(&mut pool.asset_balance, amount);
         coin::deposit(admin_addr, emergency_coins);
+    }
+
+    public entry fun transfer_admin(
+        admin: &signer,
+        new_admin: address,
+    ) acquires PoolRegistry {
+        let admin_addr = signer::address_of(admin);
+        let registry = borrow_global_mut<PoolRegistry>(get_resource_account_address());
+        
+        assert!(registry.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
+        assert!(new_admin != @0x0, error::invalid_argument(E_INVALID_ADDRESS));
+
+        registry.admin = new_admin;
     }
 }
