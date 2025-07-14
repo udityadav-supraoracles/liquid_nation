@@ -14,16 +14,20 @@ module liquid_nation::fee_controller {
     // ======================================================================================================================================================
 
     
-    /// 100% in basis points
+    /// 100% represented in basis points
     const BASIS_POINTS: u64 = 10000;
 
-    // Error codes
+    /// Comprehensive error codes for all contract operations
+    /// Invalid input for fee rate
     const E_INVALID_FEE_RATE: u64 = 1;
+    /// Invalid input for fee shares
     const E_INVALID_SHARES: u64 = 2;
+    /// Invalid input for address
     const E_INVALID_ADDRESS: u64 = 3;
+    /// Caller is not authorized
     const E_NOT_AUTHORIZED: u64 = 4;
-    const E_NOT_INITIALIZED: u64 = 5;
-    const E_PAUSED: u64 = 6;
+    /// Contract is paused
+    const E_PAUSED: u64 = 5;
 
 
     // ======================================================================================================================================================
@@ -31,17 +35,17 @@ module liquid_nation::fee_controller {
     // ======================================================================================================================================================
 
 
-    /// Fee configuration
+    /// Storage for fee configuration
     struct FeeConfig has key {
-        fee_rate: u64, // In basis points
-        treasury_share: u64, // In basis points
-        protocol_share: u64, // In basis points
+        fee_rate: u64,
+        treasury_share: u64,
+        protocol_share: u64,
         protocol_recipient: address,
         admin: address,
         paused: bool,
     }
 
-    /// Fee collection tracking
+    /// Storage for fee collection tracking
     struct FeeStats has key {
         total_fees_collected: u64,
         treasury_fees_distributed: u64,
@@ -61,13 +65,15 @@ module liquid_nation::fee_controller {
 
 
     #[event]
-    struct FeeConfigUpdated has drop, store {
+    /// Emitted when the fee rate is updated
+    struct FeeRateUpdated has drop, store {
         old_fee_rate: u64,
         new_fee_rate: u64,
         timestamp: u64,
     }
 
     #[event]
+    /// Emitted when the fee shares are updated
     struct FeeSharesUpdated has drop, store {
         old_treasury_share: u64,
         new_treasury_share: u64,
@@ -77,9 +83,18 @@ module liquid_nation::fee_controller {
     }
 
     #[event]
+    /// Emitted when the protocol recipient is updated
     struct ProtocolRecipientUpdated has drop, store {
         old_recipient: address,
         new_recipient: address,
+        timestamp: u64,
+    }
+
+    #[event]
+    /// Emitted when the admin is updated
+    struct AdminUpdated has drop, store {
+        old_admin: address,
+        new_admin: address,
         timestamp: u64,
     }
     
@@ -88,7 +103,7 @@ module liquid_nation::fee_controller {
     //                                                                      HELPER FUNCTIONS
     // ======================================================================================================================================================
 
-    /// Initialize fee controller
+    /// Initializes the module with required resources
     fun init_module(admin: &signer) {
         let admin_addr = signer::address_of(admin);
 
@@ -100,6 +115,7 @@ module liquid_nation::fee_controller {
             signer_cap,
         });
         
+        // Move FeeConfig to the resource account
         move_to(&resource_signer, FeeConfig {
             fee_rate: 200,
             treasury_share: 5000,
@@ -109,6 +125,7 @@ module liquid_nation::fee_controller {
             paused: false,
         });
 
+        // Move FeeStats to the resource account
         move_to(&resource_signer, FeeStats {
             total_fees_collected: 0,
             treasury_fees_distributed: 0,
@@ -123,8 +140,8 @@ module liquid_nation::fee_controller {
     // ======================================================================================================================================================
 
 
-    /// Distribute fees between treasury and protocol
-    public(friend) fun distribute_fees<CoinType>(total_fee_amount: u64) acquires FeeConfig, FeeStats {
+    /// Distributes fee between treasury and protocol
+    public(friend) fun distribute_fee<CoinType>(total_fee_amount: u64) acquires FeeConfig, FeeStats {
         let config = borrow_global<FeeConfig>(get_resource_account_address());
         let stats = borrow_global_mut<FeeStats>(get_resource_account_address());
         
@@ -135,7 +152,7 @@ module liquid_nation::fee_controller {
         let protocol_amount = (total_fee_amount * config.protocol_share) / BASIS_POINTS;
 
         // Distribute to protocol recipient
-        treasury_pool::distribute_fees<CoinType>(total_fee_amount, treasury_amount, protocol_amount, config.protocol_recipient);
+        treasury_pool::distribute_fee<CoinType>(total_fee_amount, treasury_amount, protocol_amount, config.protocol_recipient);
 
         // Update stats
         stats.total_fees_collected = stats.total_fees_collected + total_fee_amount;
@@ -149,7 +166,7 @@ module liquid_nation::fee_controller {
     //                                                              ADMIN FUNCTIONS
     // ======================================================================================================================================================
 
-
+    // Updates fee rate
     public entry fun set_fee_rate(
         admin: &signer,
         new_fee_rate: u64,
@@ -163,13 +180,14 @@ module liquid_nation::fee_controller {
         let old_fee_rate = config.fee_rate;
         config.fee_rate = new_fee_rate;
 
-        event::emit(FeeConfigUpdated {
+        event::emit(FeeRateUpdated {
             old_fee_rate,
             new_fee_rate,
             timestamp: timestamp::now_seconds(),
         });
     }
 
+    /// Updates fee shares for treasury and protocol
     public entry fun set_fee_shares(
         admin: &signer,
         new_treasury_share: u64,
@@ -196,6 +214,7 @@ module liquid_nation::fee_controller {
         });
     }
 
+    /// Updates protocol recipient address
     public entry fun set_protocol_recipient(
         admin: &signer,
         new_recipient: address,
@@ -216,6 +235,7 @@ module liquid_nation::fee_controller {
         });
     }
 
+    /// Pauses fee distribution
     public entry fun pause_fee_distribution(admin: &signer) acquires FeeConfig {
         let admin_addr = signer::address_of(admin);
         let config = borrow_global_mut<FeeConfig>(get_resource_account_address());
@@ -224,6 +244,7 @@ module liquid_nation::fee_controller {
         config.paused = true;
     }
 
+    /// Unpauses fee distribution
     public entry fun unpause_fee_distribution(admin: &signer) acquires FeeConfig {
         let admin_addr = signer::address_of(admin);
         let config = borrow_global_mut<FeeConfig>(get_resource_account_address());
@@ -232,17 +253,23 @@ module liquid_nation::fee_controller {
         config.paused = false;
     }
 
-    public entry fun transfer_admin(
+    /// Updates the admin of the contract
+    public entry fun update_admin(
         admin: &signer,
         new_admin: address,
     ) acquires FeeConfig {
-        let admin_addr = signer::address_of(admin);
         let config = borrow_global_mut<FeeConfig>(get_resource_account_address());
-        
-        assert!(config.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
-        assert!(new_admin != @0x0, error::invalid_argument(E_INVALID_ADDRESS));
+        let old_admin = config.admin;
 
+        assert!(old_admin == signer::address_of(admin), error::permission_denied(E_NOT_AUTHORIZED));
+        assert!(new_admin != @0x0, error::invalid_argument(E_INVALID_ADDRESS));
         config.admin = new_admin;
+        
+        event::emit(AdminUpdated{
+            old_admin,
+            new_admin,
+            timestamp: timestamp::now_seconds(),
+        });   
     }
 
     // ======================================================================================================================================================
@@ -264,6 +291,7 @@ module liquid_nation::fee_controller {
     }
 
     #[view]
+    /// Get fee stats
     public fun get_fee_stats(): (u64, u64, u64, u64) acquires FeeStats {
         let stats = borrow_global<FeeStats>(get_resource_account_address());
         (
@@ -275,7 +303,7 @@ module liquid_nation::fee_controller {
     }
 
     #[view]
-    /// Calculate fee amount
+    /// Calculates fee amount
     public fun calculate_fee(amount: u64): u64 acquires FeeConfig {
         let config = borrow_global<FeeConfig>(get_resource_account_address());
         (amount * config.fee_rate) / BASIS_POINTS

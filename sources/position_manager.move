@@ -31,26 +31,39 @@ module liquid_nation::position_manager {
 
 
     /// Comprehensive error codes for all contract operations
+    /// Caller not authorised
     const E_NOT_AUTHORIZED: u64 = 1;
+    /// Invalid leverage amount
     const E_INVALID_LEVERAGE: u64 = 2;
+    /// Invalid amount as wager
     const E_INVALID_WAGER: u64 = 3;
+    /// Contract is paused
     const E_PAUSED: u64 = 4;
+    /// Position does not exist
     const E_POSITION_NOT_FOUND: u64 = 5;
+    /// Position is closed
     const E_POSITION_CLOSED: u64 = 6;
+    /// Pool does not have sufficient balance
     const E_INSUFFICIENT_POOL_BALANCE: u64 = 7;
+    /// Stale price from oracle
     const E_ORACLE_PRICE_STALE: u64 = 8;
+    /// Position already exists
     const E_POSITION_ALREADY_EXISTS: u64 = 9;
+    /// Token is not supported
     const E_UNSUPPORTED_TOKEN: u64 = 10;
+    /// Asset does not match with the position 
     const E_INVALID_ASSET: u64 = 11;
+    /// Insufficient payout amount
     const E_INSUFFICIENT_PAYOUT: u64 = 12;
-    const E_INVALID_AMOUNT: u64 = 13;
+    /// Invalid input for address
+    const E_INVALID_ADDRESS: u64 = 13; 
 
 
     // ======================================================================================================================================================
     //                                                                          STRUCTS
     // ======================================================================================================================================================
 
-
+    /// Represents a trade position
     struct Position has store, copy, drop {
         trader: address,
         asset: String,
@@ -67,6 +80,7 @@ module liquid_nation::position_manager {
         payout_amount: u64,
     }
 
+    /// Global storage for trade positions and contract configuration
     struct PositionManager has key {
         positions: Table<u64, Position>,
         user_positions: Table<address, vector<u64>>,
@@ -88,6 +102,7 @@ module liquid_nation::position_manager {
 
 
     #[event]
+    /// Emitted when a trade position is opened
     struct PositionOpened has drop, store {
         position_id: u64,
         trader: address,
@@ -102,6 +117,7 @@ module liquid_nation::position_manager {
     }
 
     #[event]
+    /// Emitted when a trade position is closed
     struct PositionClosed has drop, store {
         position_id: u64,
         trader: address,
@@ -112,6 +128,7 @@ module liquid_nation::position_manager {
     }
 
     #[event]
+    /// Emitted when a trade position is liquidated
     struct PositionLiquidated has drop, store {
         position_id: u64,
         trader: address,
@@ -119,24 +136,32 @@ module liquid_nation::position_manager {
         timestamp: u64,
     }
 
+    #[event]
+    /// Emitted when the admin is updated
+    struct AdminUpdated has drop, store {
+        old_admin: address,
+        new_admin: address,
+        timestamp: u64,
+    }
 
     // ======================================================================================================================================================
     //                                                                      HELPER FUNCTIONS
     // ======================================================================================================================================================
 
 
-    /// Initializes the position manager
+    /// Initializes the module with required resources
     fun init_module(admin: &signer) {
         let admin_addr = signer::address_of(admin);
 
         // Create resource account for position manager
         let (resource_signer, signer_cap) = account::create_resource_account(admin, b"position_manager");
 
-        // Store the capability in the admin's account for future use
-        move_to(admin, ResourceAccountCapability {
+        // Move the capability to the resource account
+        move_to(&resource_signer, ResourceAccountCapability {
             signer_cap,
         });
-
+        
+        // Move PositionManager to resource account
         move_to(&resource_signer, PositionManager {
             positions: table::new(),
             user_positions: table::new(),
@@ -176,7 +201,8 @@ module liquid_nation::position_manager {
         }
     }
 
-    /// Calculates payout optimized for three price scenarios
+    /// Calculates if a user is in profit/loss, payout amount and profit/loss percentage
+    /// 0 represents profit and 1 represents loss
     fun calculate_payout(
         amount_wagered: u64,
         leverage: u8,
@@ -184,8 +210,6 @@ module liquid_nation::position_manager {
         current_price: u64,
         is_long: bool
     ): (u8, u64, u64) {
-        assert!(entry_price > 0, error::invalid_argument(E_INVALID_AMOUNT));
-
         // No price change - return original wager
         if (current_price == entry_price) {
             return (0, amount_wagered, 0)
@@ -280,7 +304,7 @@ module liquid_nation::position_manager {
 
         // Distribute fees
         if (fee_amount > 0) {
-            fee_controller::distribute_fees<CoinType>(fee_amount);
+            fee_controller::distribute_fee<CoinType>(fee_amount);
         };
 
         // Emit event
@@ -479,6 +503,7 @@ module liquid_nation::position_manager {
 
 
     #[view]
+    /// Returns a Position
     public fun get_position(position_id: u64): Position acquires PositionManager {
         let position_manager = borrow_global<PositionManager>(get_resource_account_address());
         assert!(table::contains(&position_manager.positions, position_id), error::not_found(E_POSITION_NOT_FOUND));
@@ -486,6 +511,7 @@ module liquid_nation::position_manager {
     }
 
     #[view]
+    /// Returns a user's positions
     public fun get_user_positions(user: address): vector<u64> acquires PositionManager {
         let position_manager = borrow_global<PositionManager>(get_resource_account_address());
         if (table::contains(&position_manager.user_positions, user)) {
@@ -496,6 +522,8 @@ module liquid_nation::position_manager {
     }
 
     #[view]
+    /// Returns if a user is in profit/loss, payout amount and profit/loss percentage
+    /// 0 represents profit and 1 represents loss
     public fun calculate_current_pnl(position_id: u64): (u8, u64, u64) acquires PositionManager {
         let position_manager = borrow_global<PositionManager>(get_resource_account_address());
         let position = table::borrow(&position_manager.positions, position_id);
@@ -545,5 +573,24 @@ module liquid_nation::position_manager {
         let position_manager = borrow_global_mut<PositionManager>(get_resource_account_address());
         assert!(position_manager.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
         position_manager.automation_account = new_automation_account;
+    }
+
+    /// Updates the admin of the contract
+    public entry fun update_admin(
+        admin: &signer,
+        new_admin: address,
+    ) acquires PositionManager {
+        let position_manager = borrow_global_mut<PositionManager>(get_resource_account_address());
+        let old_admin = position_manager.admin;
+        
+        assert!(old_admin == signer::address_of(admin), error::permission_denied(E_NOT_AUTHORIZED));
+        assert!(new_admin != @0x0, error::invalid_argument(E_INVALID_ADDRESS));
+        position_manager.admin = new_admin;
+
+        event::emit(AdminUpdated{
+            old_admin,
+            new_admin,
+            timestamp: timestamp::now_seconds()
+        });
     }
 }

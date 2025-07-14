@@ -6,8 +6,10 @@ module liquid_nation::lp_token {
     use std::option;
     use std::string::{Self, String};
     use std::table::{Self, Table};
+    use std::timestamp;
     use supra_framework::account::{Self, SignerCapability};
     use supra_framework::coin::{Self, BurnCapability, FreezeCapability, MintCapability};
+    use supra_framework::event;
     use supra_framework::type_info::{Self, TypeInfo};
 
 
@@ -16,12 +18,15 @@ module liquid_nation::lp_token {
     // ======================================================================================================================================================
 
 
-    // Error codes
+    /// Comprehensive error codes for all contract operations
+    /// Caller is not authorised
     const E_NOT_AUTHORIZED: u64 = 1;
-    const E_INSUFFICIENT_BALANCE: u64 = 2;
+    /// Invalid input for address
+    const E_INVALID_ADDRESS: u64 = 2;
+    /// LP Token is not initialized
     const E_TOKEN_NOT_INITIALIZED: u64 = 3;
+    /// LP Token is already initialized
     const E_TOKEN_ALREADY_INITIALIZED: u64 = 4;
-    const E_INVALID_ADDRESS: u64 = 5;
 
 
     // ======================================================================================================================================================
@@ -52,19 +57,33 @@ module liquid_nation::lp_token {
 
 
     // ======================================================================================================================================================
+    //                                                                          EVENTS
+    // ======================================================================================================================================================
+
+
+    #[event]
+    /// Emitted when the admin is updated
+    struct AdminUpdated has drop, store {
+        old_admin: address,
+        new_admin: address,
+        timestamp: u64,
+    }
+
+
+    // ======================================================================================================================================================
     //                                                                      HELPER FUNCTIONS
     // ======================================================================================================================================================
 
 
-    /// Initialize the module - called automatically when module is published
+    /// Initializes the module with required resources
     fun init_module(admin: &signer) {
         let admin_addr = signer::address_of(admin);
     
         // Create resource account for LP tokens
         let (resource_signer, signer_cap) = account::create_resource_account(admin, b"lp_tokens");
     
-        // Store the capability in the admin's account for future use
-        move_to(admin, ResourceAccountCapability {
+        // Move the capability to the resource account
+        move_to(&resource_signer, ResourceAccountCapability {
             signer_cap,
         });
     
@@ -81,7 +100,7 @@ module liquid_nation::lp_token {
     // ======================================================================================================================================================
 
 
-    // Initialize LP token for a specific underlying coin type
+    /// Initializes LP token for a specific underlying coin type
     public(friend) fun initialize_lp_token<CoinType>() acquires LPTokenRegistry, ResourceAccountCapability {
         let resource_addr = get_resource_account_address();
 
@@ -117,7 +136,7 @@ module liquid_nation::lp_token {
             lp_name,
             lp_symbol,
             coin_decimals,
-            true // monitor_supply
+            true    // monitor_supply
         );
 
         // Store capabilities in resource account
@@ -153,7 +172,7 @@ module liquid_nation::lp_token {
         coin::burn(coins, &caps.burn_cap);
     }
 
-    // Transfer LP tokens between accounts
+    /// Transfer LP tokens between accounts
     public entry fun transfer<CoinType>(
         from: &signer,
         to: address,
@@ -168,7 +187,7 @@ module liquid_nation::lp_token {
     //                                                              ADMIN FUNCTIONS
     // ======================================================================================================================================================
 
-
+    /// Freezes an account
     public entry fun freeze_account<CoinType>(
         admin: &signer,
         account: address,
@@ -183,6 +202,7 @@ module liquid_nation::lp_token {
         coin::freeze_coin_store(account, &caps.freeze_cap);
     }
 
+    /// Unfreezes an account
     public entry fun unfreeze_account<CoinType>(
         admin: &signer,
         account: address,
@@ -197,17 +217,23 @@ module liquid_nation::lp_token {
         coin::unfreeze_coin_store(account, &caps.freeze_cap);
     }
 
-    public entry fun transfer_admin(
+    /// Updates the admin of the contract
+    public entry fun update_admin(
         admin: &signer,
         new_admin: address,
     ) acquires LPTokenRegistry {
-        let admin_addr = signer::address_of(admin);
         let registry = borrow_global_mut<LPTokenRegistry>(get_resource_account_address());
-        
-        assert!(registry.admin == admin_addr, error::permission_denied(E_NOT_AUTHORIZED));
-        assert!(new_admin != @0x0, error::invalid_argument(E_INVALID_ADDRESS));
+        let old_admin = registry.admin;
 
+        assert!(old_admin == signer::address_of(admin), error::permission_denied(E_NOT_AUTHORIZED));
+        assert!(new_admin != @0x0, error::invalid_argument(E_INVALID_ADDRESS));
         registry.admin = new_admin;
+
+        event::emit(AdminUpdated{
+            old_admin,
+            new_admin,
+            timestamp: timestamp::now_seconds(),
+        })
     }
 
     
